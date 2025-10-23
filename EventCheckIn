@@ -1,0 +1,1060 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  onAuthStateChanged, 
+  createUserWithEmailAndPassword, 
+  signInWithEmailAndPassword, 
+  signOut,
+  signInWithCustomToken
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  addDoc, 
+  onSnapshot, 
+  doc, 
+  getDoc, 
+  updateDoc,
+  setLogLevel
+} from 'firebase/firestore';
+
+// --- Firebase Initialization ---
+const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-event-app';
+
+let app;
+let auth;
+let db;
+
+try {
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+  setLogLevel('debug'); // Enable Firestore logging
+} catch (e) {
+  console.error("Firebase initialization error:", e);
+}
+
+// --- Helper Function for Transaction Logging ---
+/**
+ * Records an event to the transaction log in Firestore.
+ * @param {object} db - The Firestore database instance.
+ * @param {string} appId - The application ID.
+ * @param {string} userEmail - The email of the user performing the action.
+ * @param {string} message - The log message.
+ */
+const logEvent = async (db, appId, userEmail, message) => {
+  if (!db || !appId) {
+    console.error("DB or AppID missing, cannot log event.");
+    return;
+  }
+  try {
+    const logCollectionRef = collection(db, `/artifacts/${appId}/public/data/transaction_log`);
+    await addDoc(logCollectionRef, {
+      timestamp: new Date(),
+      user: userEmail || 'system',
+      message: message,
+    });
+  } catch (e) {
+    console.error("Failed to write to transaction log:", e);
+    // We don't throw here, as logging is non-critical
+  }
+};
+
+
+// --- Main App Component ---
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [page, setPage] = useState('login'); // 'login', 'admin', 'scanner', 'report'
+  const [error, setError] = useState('');
+  const [userId, setUserId] = useState(null);
+
+  // Load external scanner script
+  useEffect(() => {
+    // ... (script loading code remains unchanged)
+    const scriptId = "html5-qrcode-script";
+    if (document.getElementById(scriptId)) {
+      return;
+    }
+    const script = document.createElement('script');
+    script.id = scriptId;
+    script.src = "https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"; // Switched to jsDelivr CDN
+    script.async = true;
+    script.crossOrigin = "anonymous"; // Added crossorigin attribute
+    script.onload = () => console.log("html5-qrcode script loaded successfully.");
+    script.onerror = () => console.error("Failed to load html5-qrcode script.");
+    document.body.appendChild(script);
+    return () => {
+      const existingScript = document.getElementById(scriptId);
+      if (existingScript) {
+        document.body.removeChild(existingScript);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!auth) return;
+
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setUser(user);
+        setUserId(user.uid);
+        setPage('admin'); // Default to admin dashboard on login
+        // We log sign-in here (except for the initial token-based auth)
+        if (!initialAuthToken) {
+          logEvent(db, appId, user.email, 'Organizer signed in.');
+        }
+      } else if (initialAuthToken) {
+        try {
+          await signInWithCustomToken(auth, initialAuthToken);
+          // onAuthStateChanged will run again with the new user
+          // We can log this special sign-in
+          logEvent(db, appId, 'system', 'Organizer signed in via initial token.');
+        } catch (e) {
+          console.error("Error signing in with custom token:", e);
+          setError("Failed to authenticate.");
+          setIsAuthReady(true);
+        }
+      } else {
+        // No user and no token, stay on login page
+        setUser(null);
+        setUserId(null); 
+        setPage('login');
+      }
+      setIsAuthReady(true);
+    });
+
+    return () => unsubscribe();
+  }, [db, appId]); // Added db and appId dependencies
+
+  const handleSignOut = async () => {
+    try {
+      const userEmail = auth.currentUser?.email; // Get email before signing out
+      await signOut(auth);
+      // Auth listener will handle setting user to null and page to 'login'
+      if (userEmail) {
+        await logEvent(db, appId, userEmail, 'Organizer signed out.');
+      }
+    } catch (e) {
+      console.error("Sign out error:", e);
+      setError("Failed to sign out.");
+    }
+  };
+
+  if (!isAuthReady) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-100">
+        <div className="text-2xl font-semibold text-gray-700">Loading...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 font-inter">
+      {error && <div className="p-4 text-center text-white bg-red-500">{error}</div>}
+      
+      {user && (
+        <NavBar setPage={setPage} handleSignOut={handleSignOut} />
+      )}
+
+      <main className="p-4 mx-auto max-w-7xl sm:p-6 lg:p-8">
+        {!user ? (
+          <LoginPage auth={auth} setError={setError} db={db} appId={appId} />
+        ) : (
+          <>
+            {/* Pass auth object to children for logging purposes */}
+            {page === 'admin' && <AdminDashboard db={db} appId={appId} auth={auth} />}
+            {page === 'scanner' && <ScannerPage db={db} appId={appId} auth={auth} />}
+            {page === 'report' && <ReportPage db={db} appId={appId} />}
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+// --- Navigation Bar Component ---
+function NavBar({ setPage, handleSignOut }) {
+  // ... (NavBar component remains unchanged)
+  return (
+    <nav className="sticky top-0 z-50 bg-white shadow-md">
+      <div className="px-4 mx-auto max-w-7xl sm:px-6 lg:px-8">
+        <div className="flex flex-col items-center justify-between py-2 h-auto sm:flex-row sm:h-16 sm:py-0">
+          <div className="flex items-center">
+            <span className="text-2xl font-bold text-indigo-600">EventCheck</span>
+          </div>
+          <div className="flex flex-col w-full mt-2 sm:flex-row sm:items-center sm:space-x-4 sm:w-auto sm:mt-0">
+            <NavButton onClick={() => setPage('admin')}>Admin</NavButton>
+            <NavButton onClick={() => setPage('scanner')}>Scanner</NavButton>
+            <NavButton onClick={() => setPage('report')}>Report</NavButton>
+            <button
+              onClick={handleSignOut}
+              className="w-full px-4 py-2 mt-2 text-sm font-medium text-center text-red-600 bg-red-100 rounded-md sm:w-auto sm:mt-0 hover:bg-red-200 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
+            >
+              Sign Out
+            </button>
+          </div>
+        </div>
+      </div>
+    </nav>
+  );
+}
+
+function NavButton({ onClick, children }) {
+  // ... (NavButton component remains unchanged)
+  return (
+    <button
+      onClick={onClick}
+      className="w-full px-4 py-2 text-sm font-medium text-center text-gray-700 rounded-md sm:w-auto sm:text-left hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
+    >
+      {children}
+    </button>
+  );
+}
+
+// --- Login Page Component ---
+function LoginPage({ auth, setError, db, appId }) { // Added db and appId
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handleAuth = async (e) => {
+    e.preventDefault();
+    if (!auth) {
+      setError("Authentication service is not ready.");
+      return;
+    }
+    setIsLoading(true);
+    setError('');
+    try {
+      if (isRegistering) {
+        await createUserWithEmailAndPassword(auth, email, password);
+        // Auth listener will handle login, but we log registration here
+        await logEvent(db, appId, email, 'New organizer account registered.');
+      } else {
+        await signInWithEmailAndPassword(auth, email, password);
+        // Auth listener in App.js will log the sign-in
+      }
+    } catch (e) {
+      console.error("Authentication error:", e);
+      setError(e.message);
+    }
+    setIsLoading(false);
+  };
+
+  return (
+    // ... (LoginPage component layout remains unchanged)
+    <div className="flex items-center justify-center min-h-[80vh]">
+      <div className="w-full max-w-md p-6 space-y-6 bg-white rounded-lg shadow-xl sm:p-8">
+        <h2 className="text-3xl font-extrabold text-center text-gray-900">
+          {isRegistering ? 'Register Organizer' : 'Organizer Login'}
+        </h2>
+        <form className="space-y-6" onSubmit={handleAuth}>
+          <input
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="Email address"
+            required
+            className="w-full px-4 py-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+          />
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Password"
+            required
+            className="w-full px-4 py-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+          />
+          <button
+            type="submit"
+            disabled={isLoading}
+            className="w-full px-4 py-3 font-medium text-white bg-indigo-600 rounded-md shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:bg-indigo-300"
+          >
+            {isLoading ? 'Processing...' : (isRegistering ? 'Register' : 'Sign In')}
+          </button>
+        </form>
+        <div className="text-sm text-center">
+          <button
+            onClick={() => setIsRegistering(!isRegistering)}
+            className="font-medium text-indigo-600 hover:text-indigo-500"
+          >
+            {isRegistering ? 'Already have an account? Sign In' : "Don't have an account? Register"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- Admin Dashboard Component ---
+function AdminDashboard({ db, appId, auth }) { // Added auth
+  const [participants, setParticipants] = useState([]);
+  const [newName, setNewName] = useState('');
+  const [newEmail, setNewEmail] = useState('');
+  const [newGroup, setNewGroup] = useState('');
+  const [isLoading, setIsLoading] = useState(false); // <-- Added this state
+  const [error, setError] = useState(''); // <-- Added this state
+  const [success, setSuccess] = useState(''); // <-- Added this state
+  const [csvFile, setCsvFile] = useState(null);
+  const csvInputRef = useRef(null);
+
+  const participantsCollectionRef = collection(db, `/artifacts/${appId}/public/data/participants`);
+
+  useEffect(() => {
+    // ... (participant snapshot listener remains unchanged)
+    if (!db) return;
+    const unsubscribe = onSnapshot(participantsCollectionRef, (snapshot) => {
+      const parts = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id }));
+      setParticipants(parts);
+    }, (err) => {
+      console.error("Error fetching participants:", err);
+      setError("Failed to load participants.");
+    });
+    return () => unsubscribe();
+  }, [db, appId]);
+
+  const handleAddParticipant = async (e) => {
+    e.preventDefault();
+    if (!newName || !newEmail) {
+      setError("Name and Email are required.");
+      return;
+    }
+    setIsLoading(true);
+    setError('');
+    setSuccess('');
+    try {
+      await addDoc(participantsCollectionRef, {
+        name: newName,
+        email: newEmail,
+        group: newGroup || 'N/A',
+        checkedIn: false,
+        checkInTime: null,
+      });
+      // Log this action
+      await logEvent(db, appId, auth.currentUser?.email, `Participant '${newName}' added manually.`);
+      
+      setNewName('');
+      setNewEmail('');
+      setNewGroup('');
+      setSuccess('Participant added successfully.');
+    } catch (e) {
+      console.error("Error adding participant:", e);
+      setError("Failed to add participant.");
+    }
+    setIsLoading(false);
+  };
+  
+  const handleFileChange = (e) => {
+    // ... (remains unchanged)
+    if (e.target.files && e.target.files[0]) {
+      setCsvFile(e.target.files[0]);
+    }
+  };
+
+  const handleCsvUpload = () => {
+    // ... (file reading logic remains unchanged)
+    if (!csvFile) {
+      setError("Please select a CSV file first.");
+      return;
+    }
+    setIsLoading(true);
+    setError('');
+    setSuccess('');
+    const reader = new FileReader();
+    
+    reader.onload = async (e) => {
+      const text = e.target.result;
+      const lines = text.split('\n');
+      let addedCount = 0;
+      let errorLines = [];
+      
+      for (let i = 0; i < lines.length; i++) {
+        // ... (CSV parsing logic remains unchanged)
+        const line = lines[i].trim();
+        if (!line) continue;
+        if (i === 0 && (line.toLowerCase().includes('name') || line.toLowerCase().includes('email'))) {
+          continue;
+        }
+        const [name, email, group] = line.split(',').map(s => s.trim().replace(/"/g, ''));
+        
+        if (name && email) {
+          try {
+            await addDoc(participantsCollectionRef, {
+              name: name,
+              email: email,
+              group: group || 'N/A',
+              checkedIn: false,
+              checkInTime: null,
+            });
+            addedCount++;
+          } catch (err) {
+            console.error("Error adding participant from CSV line:", line, err);
+            errorLines.push(i + 1);
+          }
+        } else if (line) {
+          errorLines.push(i + 1);
+        }
+      }
+      
+      setIsLoading(false);
+      setSuccess(`${addedCount} participants added successfully.`);
+      if (addedCount > 0) {
+        // Log this action
+        await logEvent(db, appId, auth.currentUser?.email, `${addedCount} participants added via CSV upload (${csvFile.name}).`);
+      }
+      
+      if (errorLines.length > 0) {
+        setError(`Failed to add ${errorLines.length} participants (lines: ${errorLines.join(', ')}). Check format.`);
+      }
+      
+      setCsvFile(null);
+      if (csvInputRef.current) {
+        csvInputRef.current.value = null;
+      }
+    };
+    
+    reader.onerror = () => {
+      setIsLoading(false);
+      setError("Failed to read the file.");
+    };
+    
+    reader.readAsText(csvFile);
+  };
+
+  return (
+    // ... (AdminDashboard layout remains unchanged)
+    <div className="space-y-8">
+      <h1 className="text-3xl font-bold text-gray-900">Admin Dashboard</h1>
+      {error && <p className="p-4 text-center text-red-800 bg-red-100 rounded-md">{error}</p>}
+      {success && <p className="p-4 text-center text-green-800 bg-green-100 rounded-md">{success}</p>}
+      <div className="p-4 bg-white rounded-lg shadow-lg sm:p-6">
+        <h2 className="text-2xl font-semibold text-gray-800">Add New Participant (Manual)</h2>
+        <form onSubmit={handleAddParticipant} className="mt-6 space-y-4">
+          <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
+            <input
+              type="text"
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="Full Name"
+              className="w-full px-4 py-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+            />
+            <input
+              type="email"
+              value={newEmail}
+              onChange={(e) => setNewEmail(e.target.value)}
+              placeholder="Email Address"
+              className="w-full px-4 py-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+            />
+            <input
+              type="text"
+              value={newGroup}
+              onChange={(e) => setNewGroup(e.target.value)}
+              placeholder="Group (Optional)"
+              className="w-full px-4 py-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={isLoading}
+            className="w-full px-6 py-3 font-medium text-white bg-indigo-600 rounded-md shadow-sm sm:w-auto hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:bg-indigo-300"
+          >
+            {isLoading ? 'Adding...' : 'Add Participant'}
+          </button>
+        </form>
+      </div>
+      <div className="p-4 bg-white rounded-lg shadow-lg sm:p-6">
+        <h2 className="text-2xl font-semibold text-gray-800">Upload Participants via CSV</h2>
+        <p className="mt-2 text-sm text-gray-600">
+          Upload a .csv file with columns: <strong>Name, Email, Group</strong> (Group is optional).
+        </p>
+        <div className="mt-6 space-y-4 sm:flex sm:items-center sm:space-y-0 sm:space-x-4">
+          <input
+            id="csv-input"
+            ref={csvInputRef}
+            type="file"
+            accept=".csv"
+            onChange={handleFileChange}
+            className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100"
+          />
+          <button
+            onClick={handleCsvUpload}
+            disabled={!csvFile || isLoading}
+            className="w-full px-6 py-3 font-medium text-white bg-green-600 rounded-md shadow-sm hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 disabled:bg-green-300 sm:w-auto"
+          >
+            {isLoading ? 'Uploading...' : 'Upload CSV'}
+          </button>
+        </div>
+      </div>
+      <div className="p-4 bg-white rounded-lg shadow-lg sm:p-6">
+        <h2 className="text-2xl font-semibold text-gray-800">Participant List</h2>
+        <div className="mt-6 space-y-6">
+          {participants.length === 0 ? (
+            <p className="text-gray-500">No participants added yet.</p>
+          ) : (
+            participants.map(p => <ParticipantItem key={p.id} participant={p} />)
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- Participant Item Component (for Admin) ---
+function ParticipantItem({ participant }) {
+  const [showEmailModal, setShowEmailModal] = useState(false);
+  const qrData = participant.id;
+  const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${qrData}`;
+
+  return (
+    <>
+      <div className="flex flex-col p-4 border border-gray-200 rounded-lg shadow-sm sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex-1 mb-4 sm:mb-0">
+          <p className="text-lg font-semibold text-gray-900 break-words">{participant.name}</p>
+          <p className="text-sm text-gray-600 break-words">{participant.email}</p>
+          <p className="text-sm text-gray-500">Group: {participant.group}</p>
+          <p className={`mt-2 text-sm font-medium ${participant.checkedIn ? 'text-green-600' : 'text-red-600'}`}>
+            Status: {participant.checkedIn ? `Checked In at ${new Date(participant.checkInTime?.toDate()).toLocaleString()}` : 'Not Checked In'}
+          </p>
+        </div>
+        <div className="flex flex-col items-center space-y-4 sm:ml-6 sm:items-end">
+          <img 
+            src={qrCodeUrl} 
+            alt={`QR Code for ${participant.name}`}
+            className="w-32 h-32 border border-gray-200 rounded-md"
+          />
+          <button
+            onClick={() => setShowEmailModal(true)}
+            className="w-full px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 sm:w-auto"
+          >
+            Send Email
+          </button>
+        </div>
+      </div>
+      {showEmailModal && (
+        <EmailModal 
+          participant={participant}
+          qrCodeUrl={qrCodeUrl}
+          onClose={() => setShowEmailModal(false)}
+        />
+      )}
+    </>
+  );
+}
+
+// --- Email Modal Component ---
+function EmailModal({ participant, qrCodeUrl, onClose }) {
+  const emailBodyRef = useRef(null);
+  const [copySuccess, setCopySuccess] = useState('');
+
+  const emailSubject = "Your QR Code for the Event";
+  
+  const handleMailTo = () => {
+    window.location.href = `mailto:${participant.email}?subject=${encodeURIComponent(emailSubject)}`;
+  };
+
+  const handleCopy = () => {
+    if (emailBodyRef.current) {
+      try {
+        // We use a range to select the HTML content of the preview
+        const range = document.createRange();
+        range.selectNode(emailBodyRef.current);
+        
+        // Ensure no existing selection
+        window.getSelection().removeAllRanges(); 
+        // Add the new range
+        window.getSelection().addRange(range);
+        
+        // Execute the copy command
+        const successful = document.execCommand('copy');
+        
+        if (successful) {
+          setCopySuccess('Copied to clipboard!');
+        } else {
+          setCopySuccess('Copy failed. Please copy manually.');
+        }
+        
+        // Clear selection
+        window.getSelection().removeAllRanges();
+      } catch (err) {
+        console.error('Failed to copy: ', err);
+        setCopySuccess('Copy failed. Please copy manually.');
+      }
+      
+      setTimeout(() => setCopySuccess(''), 2000);
+    }
+  };
+
+  return (
+    <div 
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black bg-opacity-50"
+      onClick={onClose}
+    >
+      <div 
+        className="relative w-full max-w-2xl bg-white rounded-lg shadow-2xl"
+        onClick={e => e.stopPropagation()} // Prevent modal close on content click
+      >
+        {/* Modal Header */}
+        <div className="flex items-center justify-between p-4 border-b">
+          <h2 className="text-xl font-semibold text-gray-800">Send Email to {participant.name}</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">&times;</button>
+        </div>
+        
+        {/* Modal Body */}
+        <div className="p-6 space-y-4">
+          <p className="text-sm text-gray-600">
+            <strong>To:</strong> {participant.email}<br/>
+            <strong>From:</strong> Your Mail App (e.g., jasman.hazly@gmail.com)<br/>
+            <strong>Subject:</strong> {emailSubject}
+          </p>
+          
+          <p className="text-sm text-gray-700">This is a preview of the email. Use the buttons below to copy the content and open your mail app.</p>
+
+          {/* Email Preview */}
+          <div 
+            ref={emailBodyRef} 
+            className="p-6 border border-gray-200 rounded-md" 
+            style={{ fontFamily: 'Arial, sans-serif', lineHeight: '1.6', color: '#333' }}
+          >
+            <p>Hi {participant.name},</p>
+            <p>Thank you for registering for our event!</p>
+            <p>Please have this unique QR code ready to be scanned at the check-in. You can show it on your phone or print it out.</p>
+            <div style={{ margin: '20px 0', textAlign: 'center' }}>
+              <img 
+                src={qrCodeUrl} 
+                alt="Your Event QR Code" 
+                style={{ width: '150px', height: '150px', border: '1px solid #ddd' }} 
+              />
+            </div>
+            <p>We look forward to seeing you there!</p>
+            <br/>
+            <p>Best regards,<br/>The Event Team</p>
+          </div>
+          
+          {copySuccess && <p className="text-sm font-medium text-center text-green-600">{copySuccess}</p>}
+        </div>
+        
+        {/* Modal Footer */}
+        <div className="flex flex-col items-center justify-end p-4 space-y-2 border-t bg-gray-50 sm:flex-row sm:space-y-0 sm:space-x-2">
+          <button
+            onClick={handleCopy}
+            className="w-full px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-md shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 sm:w-auto"
+          >
+            Copy Email Content
+          </button>
+          <button
+            onClick={handleMailTo}
+            className="w-full px-4 py-2 text-sm font-medium text-white bg-green-600 rounded-md shadow-sm hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 sm:w-auto"
+          >
+            Open Mail App
+          </button>
+          <button
+            onClick={onClose}
+            className="w-full px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md shadow-sm hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 sm:w-auto"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// --- QR Scanner Page Component ---
+function ScannerPage({ db, appId, auth }) { // Added auth
+  const [scanResult, setScanResult] = useState(null);
+  const [isScanning, setIsScanning] = useState(false); // <-- Added this state
+  const [isLoading, setIsLoading] = useState(false); // <-- Added this state
+  const html5QrCodeRef = useRef(null);
+  const qrReaderElementId = "qr-reader";
+
+  // ... (initializeScanner remains unchanged)
+  const initializeScanner = () => {
+    if (window.Html5Qrcode) {
+      try {
+        const scanner = new window.Html5Qrcode(qrReaderElementId);
+        html5QrCodeRef.current = scanner;
+        console.log("Scanner initialized.");
+      } catch (e) {
+        console.error("Failed to initialize Html5Qrcode:", e);
+      }
+    } else {
+      console.error("Failed to initialize scanner: Html5Qrcode is not available.");
+    }
+  };
+
+  /**
+   * Helper function to safely call methods on the scanner instance (like stop() or clear())
+   * that are expected to return a promise.
+   */
+  const safeScannerCall = (methodName) => {
+    if (!html5QrCodeRef.current || typeof html5QrCodeRef.current[methodName] !== 'function') {
+      return;
+    }
+    
+    try {
+      const promise = html5QrCodeRef.current[methodName]();
+      if (promise && typeof promise.catch === 'function') {
+        promise.catch(err => {
+          console.error(`Failed to execute scanner.${methodName}():`, err);
+        });
+      }
+    } catch (err) {
+      console.error(`Error thrown during scanner.${methodName}():`, err);
+    }
+  };
+
+  useEffect(() => {
+    if (!window.Html5Qrcode) {
+      console.log("html5-qrcode not found, waiting...");
+      const scriptCheckInterval = setInterval(() => {
+        if (window.Html5Qrcode) {
+          clearInterval(scriptCheckInterval);
+          console.log("Html5Qrcode library detected after delay.");
+          initializeScanner();
+        }
+      }, 100);
+      const timeout = setTimeout(() => {
+        clearInterval(scriptCheckInterval);
+        if (!window.Html5Qrcode) {
+          console.error("Html5Qrcode library is not loaded after 5 seconds.");
+        }
+      }, 5000);
+      return () => {
+        clearInterval(scriptCheckInterval);
+        clearTimeout(timeout);
+      };
+    } else {
+      console.log("html5-qrcode found immediately.");
+      initializeScanner();
+    }
+    
+    return () => {
+      // Use the safe helper function for cleanup
+      if (isScanning) {
+        safeScannerCall('stop');
+      }
+      safeScannerCall('clear');
+    };
+  }, [isScanning]); // Added isScanning to dependency array
+
+  const onScanSuccess = useCallback((decodedText, decodedResult) => {
+    console.log(`Scan successful: ${decodedText}`);
+    handleStopScan();
+    checkInParticipant(decodedText);
+  }, [db, appId, auth]); // Added auth dependency
+
+  const onScanError = (errorMessage) => {
+    // ... (remains unchanged)
+  };
+
+  const handleStartScan = () => {
+    // ... (remains unchanged)
+    if (html5QrCodeRef.current) {
+      setScanResult(null);
+      setIsScanning(true);
+      html5QrCodeRef.current.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 250, height: 250 } },
+        onScanSuccess,
+        onScanError
+      ).catch(err => {
+        setScanResult({ status: 'error', message: `Failed to start scanner: ${err.message}` });
+        setIsScanning(false);
+      });
+    } else {
+      console.error("Scanner not initialized. Cannot start scan.");
+      setScanResult({ status: 'error', message: 'Scanner is not ready. Please wait or reload.' });
+    }
+  };
+
+  const handleStopScan = () => {
+    // ... (remains unchanged)
+    if (html5QrCodeRef.current && isScanning) {
+      html5QrCodeRef.current.stop()
+        .then(() => setIsScanning(false))
+        .catch(err => console.error("Failed to stop scanner.", err));
+    }
+  };
+  
+  const checkInParticipant = async (participantId) => {
+    setIsLoading(true);
+    setScanResult(null);
+    const userEmail = auth.currentUser?.email; // Get scanner's email
+    
+    try {
+      const docRef = doc(db, `/artifacts/${appId}/public/data/participants`, participantId);
+      const docSnap = await getDoc(docRef);
+
+      if (!docSnap.exists()) {
+        setScanResult({ status: 'error', message: 'Invalid QR Code. Participant not found.' });
+        await logEvent(db, appId, userEmail, `Scan failed: Invalid ID '${participantId}'.`);
+      } else {
+        const participant = docSnap.data();
+        if (participant.checkedIn) {
+          setScanResult({ status: 'warning', message: `Already Checked In: ${participant.name} at ${new Date(participant.checkInTime.toDate()).toLocaleString()}` });
+          await logEvent(db, appId, userEmail, `Scan warning: Participant '${participant.name}' (${participantId}) already checked in.`);
+        } else {
+          await updateDoc(docRef, {
+            checkedIn: true,
+            checkInTime: new Date(),
+          });
+          setScanResult({ status: 'success', message: `Success! Welcome, ${participant.name}!` });
+          await logEvent(db, appId, userEmail, `Participant '${participant.name}' (${participantId}) checked in successfully.`);
+        }
+      }
+    } catch (e) {
+      console.error("Check-in error:", e);
+      setScanResult({ status: 'error', message: `An error occurred: ${e.message}` });
+      await logEvent(db, appId, userEmail, `Scan error for ID '${participantId}': ${e.message}`);
+    }
+    setIsLoading(false);
+  };
+  
+  const getResultColor = (status) => {
+    // ... (remains unchanged)
+    switch (status) {
+      case 'success': return 'bg-green-100 text-green-800 border-green-400';
+      case 'error': return 'bg-red-100 text-red-800 border-red-400';
+      case 'warning': return 'bg-yellow-100 text-yellow-800 border-yellow-400';
+      default: return 'bg-gray-100 text-gray-800 border-gray-400';
+    }
+  };
+
+  return (
+    // ... (ScannerPage layout remains unchanged)
+    <div className="max-w-xl p-4 mx-auto bg-white rounded-lg shadow-lg sm:p-6">
+      <h1 className="text-3xl font-bold text-center text-gray-900">Check-in Scanner</h1>
+      <div id={qrReaderElementId} className="w-full mt-6 overflow-hidden border border-gray-300 rounded-md aspect-square"></div>
+      <div className="mt-6 text-center">
+        {!isScanning ? (
+          <button
+            onClick={handleStartScan}
+            className="w-full px-6 py-3 font-medium text-white bg-indigo-600 rounded-md shadow-sm sm:w-auto hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
+          >
+            Start Scanning
+          </button>
+        ) : (
+          <button
+            onClick={handleStopScan}
+            className="w-full px-6 py-3 font-medium text-white bg-red-600 rounded-md shadow-sm sm:w-auto hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
+          >
+            Stop Scanning
+          </button>
+        )}
+      </div>
+      {(isLoading || scanResult) && (
+        <div className="mt-6">
+          {isLoading && <p className="text-lg text-center text-blue-600">Checking database...</p>}
+          {scanResult && (
+            <div className={`p-4 border rounded-md ${getResultColor(scanResult.status)}`}>
+              <p className="text-lg font-semibold text-center">{scanResult.message}</p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- Report Page Component ---
+function ReportPage({ db, appId }) {
+  const [participants, setParticipants] = useState([]);
+  const [log, setLog] = useState([]); // State for transaction log
+  const [loading, setLoading] = useState(true);
+
+  // Effect for participants
+  useEffect(() => {
+    if (!db) return;
+    const participantsCollectionRef = collection(db, `/artifacts/${appId}/public/data/participants`);
+    const unsubscribe = onSnapshot(participantsCollectionRef, (snapshot) => {
+      const parts = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id }));
+      setParticipants(parts);
+      setLoading(false);
+    }, (err) => {
+      console.error("Error fetching report:", err);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [db, appId]);
+  
+  // Effect for transaction log
+  useEffect(() => {
+    if (!db) return;
+    const logCollectionRef = collection(db, `/artifacts/${appId}/public/data/transaction_log`);
+    const unsubscribe = onSnapshot(logCollectionRef, (snapshot) => {
+      const logEntries = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id }));
+      // Sort in memory (newest first) as orderBy is not advised
+      logEntries.sort((a, b) => b.timestamp.toDate() - a.timestamp.toDate());
+      setLog(logEntries);
+    }, (err) => {
+      console.error("Error fetching transaction log:", err);
+    });
+
+    return () => unsubscribe();
+  }, [db, appId]);
+
+  const total = participants.length;
+  const checkedInCount = participants.filter(p => p.checkedIn).length;
+  const remainingCount = total - checkedInCount;
+  const checkedInPercent = total > 0 ? ((checkedInCount / total) * 100).toFixed(1) : 0;
+  
+  const handleExportTxt = () => {
+    let content = `EVENT CHECK-IN REPORT\n`;
+    content += `Generated: ${new Date().toLocaleString()}\n\n`;
+    
+    content += `--- SUMMARY ---\n`;
+    content += `Total Participants: ${total}\n`;
+    content += `Checked In: ${checkedInCount}\n`;
+    content += `Remaining: ${remainingCount}\n`;
+    content += `Check-in Progress: ${checkedInPercent}%\n\n`;
+    
+    content += `--- PARTICIPANT LIST ---\n`;
+    content += `Name, Email, Group, Status, Check-in Time\n`;
+    content += `-------------------------------------------------\n`;
+    participants.forEach(p => {
+      const status = p.checkedIn ? "CHECKED IN" : "NOT CHECKED IN";
+      const time = p.checkInTime ? new Date(p.checkInTime.toDate()).toLocaleString() : "N/A";
+      content += `${p.name}, ${p.email}, ${p.group}, ${status}, ${time}\n`;
+    });
+    content += `\n`;
+    
+    content += `--- TRANSACTION LOG (Newest First) ---\n`;
+    content += `Timestamp, User, Action\n`;
+    content += `-------------------------------------------------\n`;
+    log.forEach(l => {
+      const time = new Date(l.timestamp.toDate()).toLocaleString();
+      content += `${time}, [User: ${l.user}], ${l.message}\n`;
+    });
+    
+    // Create and trigger download
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `event_report_${new Date().toISOString().split('T')[0]}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  };
+
+  if (loading) {
+    return <div className="text-center text-xl">Loading report...</div>;
+  }
+
+  return (
+    <div className="space-y-8">
+      <div className="flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
+        <h1 className="text-3xl font-bold text-gray-900">Event Report</h1>
+        <button
+          onClick={handleExportTxt}
+          className="w-full px-6 py-3 font-medium text-white bg-blue-600 rounded-md shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 sm:w-auto"
+        >
+          Export to .TXT
+        </button>
+      </div>
+      
+      {/* Stats Cards */}
+      <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+        <StatCard title="Total Participants" value={total} color="bg-blue-500" />
+        <StatCard title="Checked In" value={checkedInCount} color="bg-green-500" />
+        <StatCard title="Remaining" value={remainingCount} color="bg-yellow-500" />
+      </div>
+      
+      {/* Progress Bar */}
+      <div className="p-4 bg-white rounded-lg shadow-lg sm:p-6">
+        <h3 className="text-xl font-semibold">Check-in Progress: {checkedInPercent}%</h3>
+        <div className="w-full mt-4 bg-gray-200 rounded-full h-2.5">
+          <div className="bg-green-500 h-2.5 rounded-full" style={{ width: `${checkedInPercent}%` }}></div>
+        </div>
+      </div>
+
+      {/* Full Participant Table */}
+      <div className="p-4 bg-white rounded-lg shadow-lg sm:p-6">
+        <h2 className="text-2xl font-semibold text-gray-800">Detailed List</h2>
+        <div className="mt-6 overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            {/* ... (table head remains unchanged) ... */}
+            <thead className="hidden bg-gray-50 md:table-header-group">
+              <tr>
+                <th className="px-6 py-3 text-xs font-medium tracking-wider text-left text-gray-500 uppercase">Name</th>
+                <th className="px-6 py-3 text-xs font-medium tracking-wider text-left text-gray-500 uppercase">Email</th>
+                <th className="px-6 py-3 text-xs font-medium tracking-wider text-left text-gray-500 uppercase">Group</th>
+                <th className="px-6 py-3 text-xs font-medium tracking-wider text-left text-gray-500 uppercase">Status</th>
+                <th className="px-6 py-3 text-xs font-medium tracking-wider text-left text-gray-500 uppercase">Check-in Time</th>
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y-0 divide-gray-200 md:divide-y">
+              {participants.map(p => (
+                <tr key={p.id} className="block mb-4 border rounded-lg shadow-sm md:table-row md:mb-0 md:border-none md:shadow-none">
+                  <td data-label="Name" className="block px-4 py-2 text-sm font-medium text-gray-900 text-right border-b md:table-cell md:py-4 md:px-6 md:text-left md:text-gray-900 md:border-b-0 whitespace-normal break-words before:content-[attr(data-label)] before:float-left before:font-semibold md:before:content-none">
+                    {p.name}
+                  </td>
+                  <td data-label="Email" className="block px-4 py-2 text-sm text-gray-700 text-right border-b md:table-cell md:py-4 md:px-6 md:text-gray-500 md:text-left md:border-b-0 whitespace-normal break-words before:content-[attr(data-label)] before:float-left before:font-semibold md:before:content-none">
+                    {p.email}
+                  </td>
+                  <td data-label="Group" className="block px-4 py-2 text-sm text-gray-700 text-right border-b md:table-cell md:py-4 md:px-6 md:text-gray-500 md:text-left md:border-b-0 whitespace-nowrap before:content-[attr(data-label)] before:float-left before:font-semibold md:before:content-none">
+                    {p.group}
+                  </td>
+                  <td data-label="Status" className="block px-4 py-2 text-sm text-gray-700 text-right border-b md:table-cell md:py-4 md:px-6 md:text-left md:border-b-0 whitespace-nowrap before:content-[attr(data-label)] before:float-left before:font-semibold md:before:content-none">
+                    {p.checkedIn ? (
+                      <span className="inline-flex px-2 text-xs font-semibold leading-5 text-green-800 bg-green-100 rounded-full">
+                        Checked In
+                      </span>
+                    ) : (
+                      <span className="inline-flex px-2 text-xs font-semibold leading-5 text-red-800 bg-red-100 rounded-full">
+                        Not Checked In
+                      </span>
+                    )}
+                  </td>
+                  <td data-label="Check-in Time" className="block px-4 py-2 text-sm text-gray-700 text-right md:table-cell md:py-4 md:px-6 md:text-gray-500 md:text-left whitespace-nowrap before:content-[attr(data-label)] before:float-left before:font-semibold md:before:content-none">
+                    {p.checkInTime ? new Date(p.checkInTime.toDate()).toLocaleString() : 'N/A'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      
+      {/* Transaction Log Display */}
+      <div className="p-4 bg-white rounded-lg shadow-lg sm:p-6">
+        <h2 className="text-2xl font-semibold text-gray-800">Recent Activity Log</h2>
+        <div className="mt-6 overflow-y-auto max-h-96">
+          <ul className="divide-y divide-gray-200">
+            {log.length === 0 ? (
+              <li className="py-3 text-gray-500">No activity recorded yet.</li>
+            ) : (
+              log.map(l => (
+                <li key={l.id} className="py-4">
+                  <p className="text-sm font-medium text-gray-900">{l.message}</p>
+                  <p className="text-sm text-gray-500">
+                    {new Date(l.timestamp.toDate()).toLocaleString()} by <strong>{l.user}</strong>
+                  </p>
+                </li>
+              ))
+            )}
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ title, value, color }) {
+  // ... (StatCard component remains unchanged)
+  return (
+    <div className={`p-6 text-white ${color} rounded-lg shadow-lg`}>
+      <h3 className="text-lg font-medium text-blue-100">{title}</h3>
+      <p className="mt-2 text-4xl font-extrabold">{value}</p>
+    </div>
+  );
+}
+
+
